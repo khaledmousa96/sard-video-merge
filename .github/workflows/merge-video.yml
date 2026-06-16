@@ -1,60 +1,83 @@
 name: Merge Sard Videos
 
 on:
-  workflow_dispatch:
-    inputs:
-      clips_json:
-        description: "JSON array of video URLs"
-        required: true
-        type: string
-      output_name:
-        description: "Output file name"
-        required: false
-        default: "final_video.mp4"
+workflow_dispatch:
+inputs:
+clips_json:
+description: "JSON array of video URLs"
+required: true
+type: string
+output_name:
+description: "Output file name"
+required: false
+default: "final_video.mp4"
 
 jobs:
-  merge:
-    runs-on: ubuntu-latest
+merge:
+runs-on: ubuntu-latest
 
-    steps:
-      - name: Install FFmpeg
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg python3
+```
+steps:
+  - name: Install FFmpeg
+    run: |
+      sudo apt-get update
+      sudo apt-get install -y ffmpeg python3
 
-      - name: Download video clips
-        env:
-          CLIPS_JSON: ${{ inputs.clips_json }}
-        run: |
-          python3 - <<'PY'
-          import json
-          import os
-          import urllib.request
+  - name: Download video clips
+    env:
+      CLIPS_JSON: ${{ inputs.clips_json }}
+    run: |
+      python3 - <<'PY'
+      import json
+      import os
+      import urllib.request
+      import shutil
 
-          clips = json.loads(os.environ["CLIPS_JSON"])
+      clips = json.loads(os.environ["CLIPS_JSON"])
 
-          if not isinstance(clips, list) or len(clips) == 0:
-              raise Exception("clips_json must be a non-empty JSON array of URLs")
+      if not isinstance(clips, list) or len(clips) == 0:
+          raise Exception("clips_json must be a non-empty JSON array of URLs")
 
-          with open("files.txt", "w", encoding="utf-8") as f:
-              for i, url in enumerate(clips, start=1):
-                  filename = f"clip_{i:03d}.mp4"
-                  print(f"Downloading {filename}...")
-                  urllib.request.urlretrieve(url, filename)
-                  f.write(f"file '{filename}'\n")
+      headers = {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+          "Accept": "video/mp4,application/octet-stream,*/*",
+          "Referer": "https://tempfile.aiquickdraw.com/"
+      }
 
-          print(f"Downloaded {len(clips)} clips.")
-          PY
+      with open("files.txt", "w", encoding="utf-8") as f:
+          for i, url in enumerate(clips, start=1):
+              url = str(url).strip()
+              filename = f"clip_{i:03d}.mp4"
 
-      - name: Merge clips with FFmpeg
-        env:
-          OUTPUT_NAME: ${{ inputs.output_name }}
-        run: |
-          ffmpeg -y -f concat -safe 0 -i files.txt \
-          -c:v libx264 -c:a aac -pix_fmt yuv420p -movflags +faststart "$OUTPUT_NAME"
+              print(f"Downloading {filename} from: {url}")
 
-      - name: Upload final video artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: final-video
-          path: ${{ inputs.output_name }}
+              req = urllib.request.Request(url, headers=headers)
+
+              with urllib.request.urlopen(req, timeout=180) as response:
+                  with open(filename, "wb") as out:
+                      shutil.copyfileobj(response, out)
+
+              size = os.path.getsize(filename)
+              print(f"Downloaded {filename} - {size} bytes")
+
+              if size < 1000:
+                  raise Exception(f"{filename} downloaded but file size is too small")
+
+              f.write(f"file '{filename}'\n")
+
+      print(f"Downloaded {len(clips)} clips successfully.")
+      PY
+
+  - name: Merge clips with FFmpeg
+    env:
+      OUTPUT_NAME: ${{ inputs.output_name }}
+    run: |
+      ffmpeg -y -f concat -safe 0 -i files.txt \
+      -c:v libx264 -c:a aac -pix_fmt yuv420p -movflags +faststart "$OUTPUT_NAME"
+
+  - name: Upload final video artifact
+    uses: actions/upload-artifact@v4
+    with:
+      name: final-video
+      path: ${{ inputs.output_name }}
+```
