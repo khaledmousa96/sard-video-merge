@@ -4,13 +4,13 @@ on:
 workflow_dispatch:
 inputs:
 clips_json:
-description: "JSON array of video URLs"
+description: JSON array of video URLs
 required: true
 type: string
 output_name:
-description: "Output file name"
+description: Output file name
 required: false
-default: "final_video.mp4"
+default: final_video.mp4
 
 jobs:
 merge:
@@ -18,10 +18,10 @@ runs-on: ubuntu-latest
 
 ```
 steps:
-  - name: Install FFmpeg
+  - name: Install FFmpeg and tools
     run: |
       sudo apt-get update
-      sudo apt-get install -y ffmpeg python3
+      sudo apt-get install -y ffmpeg python3 curl
 
   - name: Download video clips
     env:
@@ -30,35 +30,36 @@ steps:
       python3 - <<'PY'
       import json
       import os
-      import urllib.request
-      import shutil
+      import subprocess
 
       clips = json.loads(os.environ["CLIPS_JSON"])
 
       if not isinstance(clips, list) or len(clips) == 0:
-          raise Exception("clips_json must be a non-empty JSON array of URLs")
-
-      headers = {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
-          "Accept": "video/mp4,application/octet-stream,*/*",
-          "Referer": "https://tempfile.aiquickdraw.com/"
-      }
+          raise Exception("clips_json must be a non-empty JSON array of video URLs")
 
       with open("files.txt", "w", encoding="utf-8") as f:
           for i, url in enumerate(clips, start=1):
               url = str(url).strip()
               filename = f"clip_{i:03d}.mp4"
 
-              print(f"Downloading {filename} from: {url}")
+              print(f"Downloading {filename}")
+              print(url)
 
-              req = urllib.request.Request(url, headers=headers)
-
-              with urllib.request.urlopen(req, timeout=180) as response:
-                  with open(filename, "wb") as out:
-                      shutil.copyfileobj(response, out)
+              subprocess.run([
+                  "curl",
+                  "-L",
+                  "--fail",
+                  "--retry", "3",
+                  "--connect-timeout", "30",
+                  "-A", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+                  "-H", "Accept: video/mp4,application/octet-stream,*/*",
+                  "-H", "Referer: https://tempfile.aiquickdraw.com/",
+                  "-o", filename,
+                  url
+              ], check=True)
 
               size = os.path.getsize(filename)
-              print(f"Downloaded {filename} - {size} bytes")
+              print(f"{filename} size: {size} bytes")
 
               if size < 1000:
                   raise Exception(f"{filename} downloaded but file size is too small")
@@ -72,8 +73,7 @@ steps:
     env:
       OUTPUT_NAME: ${{ inputs.output_name }}
     run: |
-      ffmpeg -y -f concat -safe 0 -i files.txt \
-      -c:v libx264 -c:a aac -pix_fmt yuv420p -movflags +faststart "$OUTPUT_NAME"
+      ffmpeg -y -f concat -safe 0 -i files.txt -c:v libx264 -c:a aac -pix_fmt yuv420p -movflags +faststart "$OUTPUT_NAME"
 
   - name: Upload final video artifact
     uses: actions/upload-artifact@v4
