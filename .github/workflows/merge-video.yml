@@ -4,19 +4,19 @@ on:
 workflow_dispatch:
 inputs:
 clips_json:
-description: JSON array of video URLs
+description: "JSON array of video URLs"
 required: true
 type: string
 output_name:
-description: Output file name
+description: "Output file name"
 required: false
-default: final_video.mp4
+default: "final_video.mp4"
 
 jobs:
 merge:
 runs-on: ubuntu-latest
 
-```
+
 steps:
   - name: Install FFmpeg and tools
     run: |
@@ -80,4 +80,3 @@ steps:
     with:
       name: final-video
       path: ${{ inputs.output_name }}
-```
