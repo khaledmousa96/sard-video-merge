@@ -11,71 +11,200 @@ on:
         description: "Output file name"
         required: false
         default: "final_video.mp4"
+        type: string
+
+permissions:
+  contents: write
+  actions: read
 
 jobs:
   merge:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: true
+
       - name: Install FFmpeg and tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg python3 curl
+          sudo apt-get install -y ffmpeg jq curl
 
-      - name: Download video clips
+      - name: Prepare output name
+        run: |
+          OUT="${{ inputs.output_name }}"
+          if [ -z "$OUT" ]; then OUT="final_video.mp4"; fi
+          OUT="${OUT// /_}"
+          case "$OUT" in
+            *.mp4) ;;
+            *) OUT="${OUT}.mp4" ;;
+          esac
+          echo "OUTPUT_NAME=$OUT" >> "$GITHUB_ENV"
+
+      - name: Parse video URLs
         env:
           CLIPS_JSON: ${{ inputs.clips_json }}
         run: |
-          python3 - <<'PY'
-          import json
-          import os
-          import subprocess
+          python3 - <<'PY' > urls.txt
+          import json, os, sys
 
-          clips = json.loads(os.environ["CLIPS_JSON"])
+          raw = os.environ.get("CLIPS_JSON", "").strip()
 
-          if not isinstance(clips, list) or len(clips) == 0:
-              raise Exception("clips_json must be a non-empty JSON array of video URLs")
+          if not raw:
+              raise SystemExit("clips_json is empty")
 
-          with open("files.txt", "w", encoding="utf-8") as f:
-              for i, url in enumerate(clips, start=1):
-                  url = str(url).strip()
-                  filename = f"clip_{i:03d}.mp4"
+          try:
+              data = json.loads(raw)
+          except Exception as e:
+              raise SystemExit(f"Invalid clips_json: {e}")
 
-                  print(f"Downloading {filename}")
-                  print(url)
+          urls = []
 
-                  subprocess.run([
-                      "curl",
-                      "-L",
-                      "--fail",
-                      "--retry", "3",
-                      "--connect-timeout", "30",
-                      "-A", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
-                      "-H", "Accept: video/mp4,application/octet-stream,*/*",
-                      "-H", "Referer: https://tempfile.aiquickdraw.com/",
-                      "-o", filename,
-                      url
-                  ], check=True)
+          if isinstance(data, list):
+              for item in data:
+                  if isinstance(item, str):
+                      urls.append(item)
+                  elif isinstance(item, dict):
+                      url = (
+                          item.get("videoUrl")
+                          or item.get("video_url")
+                          or item.get("url")
+                          or item.get("video")
+                      )
+                      if url:
+                          urls.append(url)
 
-                  size = os.path.getsize(filename)
-                  print(f"{filename} size: {size} bytes")
+          elif isinstance(data, dict):
+              possible = (
+                  data.get("scene_video_urls")
+                  or data.get("video_urls")
+                  or data.get("clips")
+                  or data.get("urls")
+              )
 
-                  if size < 1000:
-                      raise Exception(f"{filename} downloaded but file size is too small")
+              if isinstance(possible, list):
+                  for item in possible:
+                      if isinstance(item, str):
+                          urls.append(item)
+                      elif isinstance(item, dict):
+                          url = (
+                              item.get("videoUrl")
+                              or item.get("video_url")
+                              or item.get("url")
+                              or item.get("video")
+                          )
+                          if url:
+                              urls.append(url)
 
-                  f.write(f"file '{filename}'\n")
+          urls = [u.strip() for u in urls if isinstance(u, str) and u.strip()]
 
-          print(f"Downloaded {len(clips)} clips successfully.")
+          if not urls:
+              raise SystemExit("No video URLs found in clips_json")
+
+          for u in urls:
+              print(u)
           PY
 
-      - name: Merge clips with FFmpeg
-        env:
-          OUTPUT_NAME: ${{ inputs.output_name }}
+          echo "Found video URLs:"
+          cat urls.txt
+
+      - name: Download video clips
         run: |
-          ffmpeg -y -f concat -safe 0 -i files.txt -c:v libx264 -c:a aac -pix_fmt yuv420p -movflags +faststart "$OUTPUT_NAME"
+          mkdir -p clips normalized output
+
+          i=1
+          while IFS= read -r url; do
+            num=$(printf "%03d" "$i")
+            out="clips/clip_${num}.mp4"
+
+            echo "Downloading clip $i"
+            curl -L --fail --retry 5 --retry-delay 5 --connect-timeout 30 -o "$out" "$url"
+
+            if [ ! -s "$out" ]; then
+              echo "Downloaded file is empty: $out"
+              exit 1
+            fi
+
+            i=$((i+1))
+          done < urls.txt
+
+          ls -lh clips
+
+      - name: Normalize clips
+        run: |
+          mkdir -p normalized
+
+          i=1
+          for file in clips/*.mp4; do
+            num=$(printf "%03d" "$i")
+            out="normalized/clip_${num}.mp4"
+
+            echo "Normalizing $file"
+
+            ffmpeg -y -i "$file" \
+              -t 15 \
+              -vf "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,fps=30,format=yuv420p" \
+              -c:v libx264 \
+              -preset veryfast \
+              -crf 23 \
+              -c:a aac \
+              -ar 44100 \
+              -ac 2 \
+              -b:a 128k \
+              "$out"
+
+            i=$((i+1))
+          done
+
+          ls -lh normalized
+
+      - name: Merge clips with FFmpeg
+        run: |
+          rm -f list.txt
+
+          for file in normalized/*.mp4; do
+            echo "file '$PWD/$file'" >> list.txt
+          done
+
+          cat list.txt
+
+          ffmpeg -y \
+            -f concat \
+            -safe 0 \
+            -i list.txt \
+            -c copy \
+            "output/${OUTPUT_NAME}"
+
+          if [ ! -s "output/${OUTPUT_NAME}" ]; then
+            echo "Final video was not created"
+            exit 1
+          fi
+
+          ls -lh output
+
+      - name: Save direct video link
+        run: |
+          DIRECT_URL="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/output/${OUTPUT_NAME}?run=${GITHUB_RUN_ID}"
+          echo "$DIRECT_URL" > output/direct_video_url.txt
+          echo "DIRECT_VIDEO_URL=$DIRECT_URL" >> "$GITHUB_ENV"
+          echo "Direct video URL:"
+          echo "$DIRECT_URL"
+
+      - name: Commit final video to repository
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add "output/${OUTPUT_NAME}" output/direct_video_url.txt
+
+          git commit -m "Update final merged video" || echo "No changes to commit"
+          git push origin main
 
       - name: Upload final video artifact
         uses: actions/upload-artifact@v4
         with:
           name: final-video
-          path: ${{ inputs.output_name }}
+          path: output/${{ env.OUTPUT_NAME }}
