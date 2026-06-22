@@ -25,18 +25,19 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install FFmpeg
+      - name: Install FFmpeg and Curl
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg curl
 
       - name: Prepare folders
         run: |
+          rm -rf input normalized output list.txt
           mkdir -p input
           mkdir -p normalized
           mkdir -p output
 
-      - name: Download and normalize clips to vertical 9:16
+      - name: Download, normalize, and merge shorts to 9:16
         env:
           CLIPS_JSON: ${{ github.event.inputs.clips_json }}
           OUTPUT_NAME: ${{ github.event.inputs.output_name }}
@@ -44,19 +45,27 @@ jobs:
           python3 <<'PY'
           import os
           import json
-          import urllib.request
           import subprocess
           from pathlib import Path
 
           raw = os.environ.get("CLIPS_JSON", "").strip()
           output_name = os.environ.get("OUTPUT_NAME", "final_short.mp4").strip() or "final_short.mp4"
 
+          if not output_name.lower().endswith(".mp4"):
+              output_name += ".mp4"
+
+          def run(cmd):
+              print("Running:", " ".join(str(x) for x in cmd))
+              subprocess.run(cmd, check=True)
+
           def parse_clips(value):
               data = value
 
-              for _ in range(5):
+              for _ in range(8):
                   if isinstance(data, str):
                       data = data.strip()
+                      if not data:
+                          break
                       data = json.loads(data)
                   else:
                       break
@@ -66,28 +75,28 @@ jobs:
               if isinstance(data, list):
                   for item in data:
                       if isinstance(item, str):
-                          urls.append(item)
+                          urls.append(item.strip())
                       elif isinstance(item, dict):
                           url = (
                               item.get("videoUrl")
                               or item.get("video_url")
+                              or item.get("videoURL")
+                              or item.get("video_url_task")
                               or item.get("videoUrlTask")
-                              or item.get("videoUrlTaskId")
+                              or item.get("videoTaskUrl")
                               or item.get("url")
                               or item.get("video")
-                              or item.get("videoUrl")
+                              or item.get("videoUrlTaskId")
                           )
                           if url:
-                              urls.append(url)
+                              urls.append(str(url).strip())
+
+              urls = [u for u in urls if u.startswith("http")]
 
               if not urls:
-                  raise ValueError("No video URLs found inside clips_json")
+                  raise ValueError("No valid video URLs found inside clips_json")
 
               return urls
-
-          def run(cmd):
-              print("Running:", " ".join(cmd))
-              subprocess.run(cmd, check=True)
 
           def ffprobe_has_audio(path):
               result = subprocess.run(
@@ -118,13 +127,29 @@ jobs:
                   stderr=subprocess.PIPE,
                   text=True,
               )
+
               try:
                   return max(float(result.stdout.strip()), 1.0)
               except Exception:
                   return 8.0
 
-          clips = parse_clips(raw)
+          def ffprobe_size(path):
+              result = subprocess.run(
+                  [
+                      "ffprobe",
+                      "-v", "error",
+                      "-select_streams", "v:0",
+                      "-show_entries", "stream=width,height",
+                      "-of", "csv=s=x:p=0",
+                      str(path),
+                  ],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  text=True,
+              )
+              return result.stdout.strip()
 
+          clips = parse_clips(raw)
           print(f"Found {len(clips)} clips")
 
           normalized_files = []
@@ -150,7 +175,26 @@ jobs:
               output_path = Path("normalized") / f"clip_{index:02d}.mp4"
 
               print(f"Downloading clip {index}: {url}")
-              urllib.request.urlretrieve(url, input_path)
+
+              download_cmd = [
+                  "curl",
+                  "-L",
+                  "--retry", "5",
+                  "--retry-delay", "5",
+                  "--connect-timeout", "30",
+                  "--max-time", "300",
+                  "-A", "Mozilla/5.0",
+                  "-o", str(input_path),
+                  url,
+              ]
+
+              run(download_cmd)
+
+              if not input_path.exists() or input_path.stat().st_size < 1000:
+                  raise ValueError(f"Downloaded file is empty or invalid: {url}")
+
+              print(f"Downloaded size: {input_path.stat().st_size} bytes")
+              print(f"Original video size: {ffprobe_size(input_path)}")
 
               has_audio = ffprobe_has_audio(input_path)
 
@@ -199,6 +243,11 @@ jobs:
                   ]
 
               run(cmd)
+
+              if not output_path.exists() or output_path.stat().st_size < 1000:
+                  raise ValueError(f"Normalized file is empty or invalid: {output_path}")
+
+              print(f"Normalized video size: {ffprobe_size(output_path)}")
               normalized_files.append(output_path)
 
           with open("list.txt", "w", encoding="utf-8") as f:
@@ -226,22 +275,23 @@ jobs:
               str(final_path),
           ])
 
-          print("Final video info:")
-          run([
-              "ffprobe",
-              "-v", "error",
-              "-select_streams", "v:0",
-              "-show_entries", "stream=width,height",
-              "-of", "csv=s=x:p=0",
-              str(final_path),
-          ])
+          if not final_path.exists() or final_path.stat().st_size < 1000:
+              raise ValueError("Final short was not created correctly")
 
-          print(f"Final short created: {final_path}")
+          final_size = ffprobe_size(final_path)
+          print(f"Final short path: {final_path}")
+          print(f"Final short video size: {final_size}")
+          print(f"Final short file size: {final_path.stat().st_size} bytes")
+
+          if final_size != "720x1280":
+              raise ValueError(f"Final video is not 9:16 vertical. Current size: {final_size}")
+
+          print("SUCCESS: final_short.mp4 created as 720x1280 vertical short")
           PY
 
       - name: Upload final short artifact
         uses: actions/upload-artifact@v4
         with:
           name: final-video
-          path: output/final_short.mp4
+          path: output/*.mp4
           if-no-files-found: error
