@@ -1,0 +1,243 @@
+name: Merge Sard Shorts
+
+on:
+  workflow_dispatch:
+    inputs:
+      clips_json:
+        description: "JSON array of video clip URLs"
+        required: true
+        type: string
+      output_name:
+        description: "Output video file name"
+        required: false
+        default: "final_short.mp4"
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  merge-shorts:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Prepare folders
+        run: |
+          mkdir -p input
+          mkdir -p normalized
+          mkdir -p output
+
+      - name: Download and normalize clips to 9:16
+        env:
+          CLIPS_JSON: ${{ github.event.inputs.clips_json }}
+          OUTPUT_NAME: ${{ github.event.inputs.output_name }}
+        run: |
+          python3 <<'PY'
+          import os
+          import json
+          import urllib.request
+          import subprocess
+          from pathlib import Path
+
+          raw = os.environ.get("CLIPS_JSON", "").strip()
+          output_name = os.environ.get("OUTPUT_NAME", "final_short.mp4").strip() or "final_short.mp4"
+
+          def parse_clips(value):
+              data = value
+              for _ in range(5):
+                  if isinstance(data, str):
+                      data = data.strip()
+                      data = json.loads(data)
+                  else:
+                      break
+
+              if isinstance(data, list):
+                  urls = []
+                  for item in data:
+                      if isinstance(item, str):
+                          urls.append(item)
+                      elif isinstance(item, dict):
+                          url = (
+                              item.get("videoUrl")
+                              or item.get("video_url")
+                              or item.get("videoUrlTask")
+                              or item.get("url")
+                              or item.get("video")
+                          )
+                          if url:
+                              urls.append(url)
+                  return urls
+
+              raise ValueError("clips_json must be a JSON array of URLs")
+
+          clips = parse_clips(raw)
+
+          if not clips:
+              raise ValueError("No clips found in clips_json")
+
+          print(f"Found {len(clips)} clips")
+
+          def run(cmd):
+              print("Running:", " ".join(cmd))
+              subprocess.run(cmd, check=True)
+
+          def ffprobe_has_audio(path):
+              result = subprocess.run(
+                  [
+                      "ffprobe",
+                      "-v", "error",
+                      "-select_streams", "a",
+                      "-show_entries", "stream=index",
+                      "-of", "csv=p=0",
+                      str(path),
+                  ],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  text=True,
+              )
+              return bool(result.stdout.strip())
+
+          def ffprobe_duration(path):
+              result = subprocess.run(
+                  [
+                      "ffprobe",
+                      "-v", "error",
+                      "-show_entries", "format=duration",
+                      "-of", "default=noprint_wrappers=1:nokey=1",
+                      str(path),
+                  ],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  text=True,
+              )
+              try:
+                  return max(float(result.stdout.strip()), 1.0)
+              except Exception:
+                  return 8.0
+
+          video_filter = (
+              "[0:v]"
+              "scale=720:1280:force_original_aspect_ratio=increase,"
+              "crop=720:1280,"
+              "boxblur=18:1"
+              "[bg];"
+              "[0:v]"
+              "scale=720:1280:force_original_aspect_ratio=decrease"
+              "[fg];"
+              "[bg][fg]"
+              "overlay=(W-w)/2:(H-h)/2,"
+              "setsar=1,"
+              "format=yuv420p"
+              "[v]"
+          )
+
+          normalized_files = []
+
+          for index, url in enumerate(clips, start=1):
+              input_path = Path("input") / f"clip_{index:02d}.mp4"
+              output_path = Path("normalized") / f"clip_{index:02d}.mp4"
+
+              print(f"Downloading clip {index}: {url}")
+              urllib.request.urlretrieve(url, input_path)
+
+              has_audio = ffprobe_has_audio(input_path)
+
+              if has_audio:
+                  cmd = [
+                      "ffmpeg",
+                      "-y",
+                      "-i", str(input_path),
+                      "-filter_complex", video_filter,
+                      "-map", "[v]",
+                      "-map", "0:a:0",
+                      "-r", "30",
+                      "-c:v", "libx264",
+                      "-preset", "veryfast",
+                      "-crf", "23",
+                      "-pix_fmt", "yuv420p",
+                      "-c:a", "aac",
+                      "-ar", "44100",
+                      "-ac", "2",
+                      "-shortest",
+                      str(output_path),
+                  ]
+              else:
+                  duration = ffprobe_duration(input_path)
+                  cmd = [
+                      "ffmpeg",
+                      "-y",
+                      "-i", str(input_path),
+                      "-f", "lavfi",
+                      "-t", str(duration),
+                      "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+                      "-filter_complex", video_filter,
+                      "-map", "[v]",
+                      "-map", "1:a:0",
+                      "-r", "30",
+                      "-c:v", "libx264",
+                      "-preset", "veryfast",
+                      "-crf", "23",
+                      "-pix_fmt", "yuv420p",
+                      "-c:a", "aac",
+                      "-ar", "44100",
+                      "-ac", "2",
+                      "-shortest",
+                      str(output_path),
+                  ]
+
+              run(cmd)
+              normalized_files.append(output_path)
+
+          with open("list.txt", "w", encoding="utf-8") as f:
+              for file_path in normalized_files:
+                  absolute_path = file_path.resolve()
+                  f.write(f"file '{absolute_path}'\n")
+
+          final_path = Path("output") / output_name
+
+          run([
+              "ffmpeg",
+              "-y",
+              "-f", "concat",
+              "-safe", "0",
+              "-i", "list.txt",
+              "-vf", "scale=720:1280,setsar=1,format=yuv420p",
+              "-r", "30",
+              "-c:v", "libx264",
+              "-preset", "veryfast",
+              "-crf", "23",
+              "-pix_fmt", "yuv420p",
+              "-c:a", "aac",
+              "-ar", "44100",
+              "-ac", "2",
+              "-movflags", "+faststart",
+              str(final_path),
+          ])
+
+          run([
+              "ffprobe",
+              "-v", "error",
+              "-select_streams", "v:0",
+              "-show_entries", "stream=width,height",
+              "-of", "csv=s=x:p=0",
+              str(final_path),
+          ])
+
+          print(f"Final short created: {final_path}")
+          PY
+
+      - name: Upload final short artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-video
+          path: output/final_short.mp4
+          if-no-files-found: error
