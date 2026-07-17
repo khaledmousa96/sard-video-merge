@@ -1,0 +1,366 @@
+name: Build Channel Shorts Compilation
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel_url:
+        description: "YouTube Shorts channel URL"
+        required: false
+        default: "https://www.youtube.com/@truelegends-f1j/shorts"
+        type: string
+      max_clips:
+        description: "Number of shorts to include"
+        required: false
+        default: "10"
+        type: string
+      pool_size:
+        description: "How many recent channel shorts to scan"
+        required: false
+        default: "60"
+        type: string
+      output_name:
+        description: "Output long video file name"
+        required: false
+        default: "cleaning_compilation.mp4"
+        type: string
+      min_clips:
+        description: "Minimum clips required to build a compilation"
+        required: false
+        default: "6"
+        type: string
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  build-compilation:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install FFmpeg and Python dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg python3-pip
+          python3 -m pip install --upgrade pip
+          python3 -m pip install yt-dlp
+
+      - name: Build 16:9 compilation from channel Shorts
+        env:
+          CHANNEL_URL: ${{ github.event.inputs.channel_url }}
+          MAX_CLIPS: ${{ github.event.inputs.max_clips }}
+          MIN_CLIPS: ${{ github.event.inputs.min_clips }}
+          POOL_SIZE: ${{ github.event.inputs.pool_size }}
+          OUTPUT_NAME: ${{ github.event.inputs.output_name }}
+        run: |
+          python3 <<'PY'
+          import json
+          import os
+          import random
+          import re
+          import shutil
+          import subprocess
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          from yt_dlp import YoutubeDL
+
+          channel_url = os.environ.get("CHANNEL_URL", "https://www.youtube.com/@truelegends-f1j/shorts").strip()
+          max_clips = int(os.environ.get("MAX_CLIPS", "10") or "10")
+          min_clips = int(os.environ.get("MIN_CLIPS", "6") or "6")
+          pool_size = int(os.environ.get("POOL_SIZE", "60") or "60")
+          output_name = os.environ.get("OUTPUT_NAME", "cleaning_compilation.mp4").strip() or "cleaning_compilation.mp4"
+          if not output_name.lower().endswith(".mp4"):
+              output_name += ".mp4"
+
+          for folder in ["input", "normalized", "output", "metadata", "data"]:
+              Path(folder).mkdir(parents=True, exist_ok=True)
+
+          history_path = Path("data") / "compiled_shorts_history.json"
+          if history_path.exists():
+              try:
+                  history = json.loads(history_path.read_text(encoding="utf-8"))
+              except Exception:
+                  history = {}
+          else:
+              history = {}
+          history.setdefault("counts", {})
+          history.setdefault("compilations", [])
+
+          def run(cmd):
+              print("Running:", " ".join(str(x) for x in cmd))
+              subprocess.run(cmd, check=True)
+
+          def ffprobe_has_audio(path):
+              result = subprocess.run(
+                  ["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", str(path)],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  text=True,
+              )
+              return bool(result.stdout.strip())
+
+          def ffprobe_duration(path):
+              result = subprocess.run(
+                  ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  text=True,
+              )
+              try:
+                  return max(float(result.stdout.strip()), 0.1)
+              except Exception:
+                  return 30.0
+
+          def ffprobe_size(path):
+              result = subprocess.run(
+                  ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", str(path)],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  text=True,
+              )
+              return result.stdout.strip()
+
+          def clean_title(title):
+              title = re.sub(r"#\w+", "", title or "").strip()
+              title = re.sub(r"\s+", " ", title)
+              return title[:90] or "Satisfying Cleaning Transformation"
+
+          def format_time(seconds):
+              seconds = int(round(seconds))
+              return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+          print(f"Scanning channel shorts: {channel_url}")
+          flat_opts = {
+              "quiet": True,
+              "extract_flat": "in_playlist",
+              "playlistend": pool_size,
+              "skip_download": True,
+          }
+          with YoutubeDL(flat_opts) as ydl:
+              info = ydl.extract_info(channel_url, download=False)
+
+          raw_entries = [e for e in (info.get("entries") or []) if e]
+          print(f"Raw entries found: {len(raw_entries)}")
+
+          candidates = []
+          seen = set()
+          meta_opts = {"quiet": True, "skip_download": True, "noplaylist": True}
+          with YoutubeDL(meta_opts) as ydl:
+              for entry in raw_entries:
+                  vid = entry.get("id") or entry.get("url")
+                  if not vid or vid in seen:
+                      continue
+                  seen.add(vid)
+                  video_url = f"https://www.youtube.com/watch?v={vid}" if not str(vid).startswith("http") else str(vid)
+                  try:
+                      meta = ydl.extract_info(video_url, download=False)
+                  except Exception as exc:
+                      print(f"Skipping metadata failure for {video_url}: {exc}")
+                      continue
+                  duration = meta.get("duration") or 0
+                  if duration and duration > 180:
+                      print(f"Skipping long video: {meta.get('title')} ({duration}s)")
+                      continue
+                  candidates.append({
+                      "id": meta.get("id") or vid,
+                      "url": f"https://www.youtube.com/watch?v={meta.get('id') or vid}",
+                      "short_url": f"https://www.youtube.com/shorts/{meta.get('id') or vid}",
+                      "title": clean_title(meta.get("title") or entry.get("title") or "Cleaning Transformation"),
+                      "duration": float(duration or 30),
+                      "upload_date": meta.get("upload_date") or "",
+                      "view_count": meta.get("view_count") or 0,
+                  })
+
+          if len(candidates) < min_clips:
+              raise ValueError(f"Only {len(candidates)} usable shorts found. Minimum required is {min_clips}.")
+
+          last_ids = set(history.get("compilations", [])[-1].get("ids", [])) if history.get("compilations") else set()
+          counts = history.get("counts", {})
+
+          # Prefer low-reuse clips and avoid the immediately previous compilation when possible.
+          selectable = [c for c in candidates if c["id"] not in last_ids]
+          if len(selectable) < min_clips:
+              selectable = candidates[:]
+
+          selectable.sort(key=lambda c: (int(counts.get(c["id"], 0)), -int(c.get("view_count") or 0), candidates.index(c)))
+          selected = selectable[:max_clips]
+          if len(selected) < min_clips:
+              raise ValueError(f"Only {len(selected)} selected shorts. Minimum required is {min_clips}.")
+
+          print("Selected shorts:")
+          for i, clip in enumerate(selected, 1):
+              print(f"{i:02d}. {clip['id']} | {clip['title']} | {clip['short_url']}")
+
+          normalized_files = []
+          chapter_starts = []
+          elapsed = 0.0
+
+          video_filter = (
+              "[0:v]"
+              "scale=1920:1080:force_original_aspect_ratio=increase,"
+              "crop=1920:1080,"
+              "boxblur=24:1"
+              "[bg];"
+              "[0:v]"
+              "scale=608:1080:force_original_aspect_ratio=decrease"
+              "[fg];"
+              "[bg][fg]"
+              "overlay=(W-w)/2:(H-h)/2,"
+              "setsar=1,"
+              "format=yuv420p"
+              "[v]"
+          )
+
+          download_opts_base = {
+              "format": "bv*[height<=1080]+ba/b[height<=1080]/best",
+              "merge_output_format": "mp4",
+              "noplaylist": True,
+              "quiet": False,
+              "retries": 5,
+              "fragment_retries": 5,
+          }
+
+          for index, clip in enumerate(selected, start=1):
+              base = Path("input") / f"clip_{index:02d}"
+              outtmpl = str(base) + ".%(ext)s"
+              download_opts = dict(download_opts_base)
+              download_opts["outtmpl"] = outtmpl
+
+              print(f"Downloading clip {index}: {clip['short_url']}")
+              with YoutubeDL(download_opts) as ydl:
+                  ydl.download([clip["short_url"]])
+
+              downloaded_files = sorted(Path("input").glob(f"clip_{index:02d}.*"), key=lambda p: p.stat().st_size, reverse=True)
+              if not downloaded_files:
+                  raise ValueError(f"Download failed for {clip['short_url']}")
+              input_path = downloaded_files[0]
+              if input_path.stat().st_size < 1000:
+                  raise ValueError(f"Downloaded file is invalid: {input_path}")
+
+              output_path = Path("normalized") / f"clip_{index:02d}.mp4"
+              has_audio = ffprobe_has_audio(input_path)
+              duration = ffprobe_duration(input_path)
+              chapter_starts.append((elapsed, clip["title"]))
+              elapsed += duration
+
+              if has_audio:
+                  cmd = [
+                      "ffmpeg", "-y", "-i", str(input_path),
+                      "-filter_complex", video_filter,
+                      "-map", "[v]", "-map", "0:a:0",
+                      "-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+                      "-pix_fmt", "yuv420p", "-c:a", "aac", "-ar", "44100", "-ac", "2",
+                      "-shortest", str(output_path),
+                  ]
+              else:
+                  cmd = [
+                      "ffmpeg", "-y", "-i", str(input_path),
+                      "-f", "lavfi", "-t", str(duration), "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+                      "-filter_complex", video_filter,
+                      "-map", "[v]", "-map", "1:a:0",
+                      "-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+                      "-pix_fmt", "yuv420p", "-c:a", "aac", "-ar", "44100", "-ac", "2",
+                      "-shortest", str(output_path),
+                  ]
+
+              run(cmd)
+              if not output_path.exists() or output_path.stat().st_size < 1000:
+                  raise ValueError(f"Normalized file is invalid: {output_path}")
+              print(f"Normalized clip size: {ffprobe_size(output_path)}")
+              normalized_files.append(output_path)
+
+          list_path = Path("list.txt")
+          with list_path.open("w", encoding="utf-8") as f:
+              for file_path in normalized_files:
+                  f.write(f"file '{file_path.resolve()}'\n")
+
+          final_path = Path("output") / output_name
+          run([
+              "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_path),
+              "-vf", "scale=1920:1080,setsar=1,format=yuv420p",
+              "-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+              "-pix_fmt", "yuv420p", "-c:a", "aac", "-ar", "44100", "-ac", "2",
+              "-movflags", "+faststart", str(final_path),
+          ])
+
+          if not final_path.exists() or final_path.stat().st_size < 1000:
+              raise ValueError("Compilation video was not created")
+
+          final_size = ffprobe_size(final_path)
+          print(f"Final video size: {final_size}")
+          if final_size != "1920x1080":
+              raise ValueError(f"Final compilation is not 16:9 1920x1080. Current size: {final_size}")
+
+          now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+          title = "10 Satisfying Cleaning Transformations You Need to See #Cleaning"
+          if len(selected) != 10:
+              title = f"{len(selected)} Satisfying Cleaning Transformations You Need to See #Cleaning"
+
+          chapters = []
+          for start, clip_title in chapter_starts:
+              chapters.append(f"{format_time(start)} {clip_title}")
+
+          description = (
+              "Watch satisfying cleaning transformations from messy garages, dirty sofas, patios, balconies, and deep cleaning resets.\n\n"
+              "This compilation brings together some of the best True Legends cleaning and before-and-after transformation Shorts in one long video.\n\n"
+              "Chapters:\n" + "\n".join(chapters) + "\n\n"
+              "Subscribe to True Legends for daily satisfying cleaning and transformation videos.\n\n"
+              "#cleaning\n#satisfying\n#deepcleaning\n#beforeafter\n#transformation"
+          )
+
+          metadata = {
+              "title": title,
+              "description": description,
+              "tags": [
+                  "cleaning compilation", "satisfying cleaning", "deep cleaning", "before and after",
+                  "cleaning transformation", "garage cleaning", "sofa cleaning", "pressure washing",
+                  "patio cleaning", "balcony cleaning", "true legends"
+              ],
+              "category_id": "26",
+              "privacy_status": "public",
+              "made_for_kids": False,
+              "selected_shorts": selected,
+              "created_at": now,
+              "output_name": output_name,
+          }
+          Path("metadata/compilation_metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+
+          compilation_record = {
+              "created_at": datetime.now(timezone.utc).isoformat(),
+              "ids": [c["id"] for c in selected],
+              "titles": [c["title"] for c in selected],
+              "output_name": output_name,
+          }
+          history["compilations"].append(compilation_record)
+          history["compilations"] = history["compilations"][-100:]
+          for c in selected:
+              history["counts"][c["id"]] = int(history["counts"].get(c["id"], 0)) + 1
+          history_path.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+
+          print("SUCCESS: 16:9 long compilation created")
+          print(f"Output: {final_path}")
+          print(f"Metadata: metadata/compilation_metadata.json")
+          PY
+
+      - name: Commit compilation history
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/compiled_shorts_history.json
+          git commit -m "Update channel shorts compilation history" || echo "No history changes to commit"
+          git push || echo "History push skipped"
+
+      - name: Upload final compilation artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-long-compilation
+          path: |
+            output/*.mp4
+            metadata/compilation_metadata.json
+          if-no-files-found: error
